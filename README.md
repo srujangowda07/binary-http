@@ -3,7 +3,7 @@
 
 ---
 
-## 📌 Executive Summary
+##  Executive Summary
 
 **Binary HTTP (BHTTP)** is an application-layer network protocol designed and implemented in standard C (C99) directly over raw TCP sockets (`SOCK_STREAM`). 
 
@@ -20,7 +20,7 @@ The project provides two core applications:
 
 ---
 
-## 📖 Table of Contents
+##  Table of Contents
 
 1. [Core Protocol Concepts](#-core-protocol-concepts)
    - [Why Binary Framing?](#1-why-binary-framing)
@@ -40,7 +40,7 @@ The project provides two core applications:
 
 ---
 
-## 🧠 Core Protocol Concepts
+##  Core Protocol Concepts
 
 ### 1. Why Binary Framing?
 - **No Delimiter Injection:** In text HTTP, messages terminate with `\r\n\r\n`. Any payload containing accidental or malicious line breaks requires complex chunked encoding. In BHTTP, payload length is explicitly defined in binary, making delimiter injection mathematically impossible.
@@ -116,7 +116,7 @@ If an endpoint encounters an unknown frame type (e.g. `0xAA`), it reads the 24-b
 
 ---
 
-## 🚀 Quick Start & Build Instructions
+##  Quick Start & Build Instructions
 
 ### Prerequisites
 - GCC / Clang (with C99 support)
@@ -151,7 +151,7 @@ Because BHTTP utilizes standard POSIX/BSD socket APIs (`<sys/socket.h>`, `<netdb
    ```
 2. Navigate to your repository directory:
    ```bash
-   cd /mnt/c/Users/<YourUsername>/OneDrive/Documents/binary-http
+   cd /.../binary-http
    ```
 3. Build and test:
    ```bash
@@ -181,7 +181,7 @@ wsl ./bcurl localhost:9000/index.html
 
 ---
 
-## 💻 Running the Server & Client
+##  Running the Server & Client
 
 ### 1. Start the Server
 Open Terminal 1:
@@ -219,7 +219,7 @@ Open Terminal 2:
 
 ---
 
-## 🔍 Example Outputs & Wire Traces
+##  Example Outputs & Wire Traces
 
 ### Normal Execution (Clean `stdout`)
 ```bash
@@ -292,7 +292,7 @@ $ ./bcurl -v localhost:9000/../../etc/passwd
 
 ---
 
-## 🧪 Testing Suite & Validation
+## Testing Suite & Validation
 
 Run the automated test suite with:
 ```bash
@@ -316,7 +316,7 @@ make test
 
 ---
 
-## 📂 Repository Structure
+##  Repository Structure
 
 ```
 binary-http/
@@ -351,7 +351,7 @@ binary-http/
 
 ---
 
-## 🎓 Summary of Technical Highlights
+##  Summary of Technical Highlights
 
 - **Standard C99:** Written cleanly without proprietary compiler extensions.
 - **Robust POSIX Sockets:** Comprehensive handling of partial transfers and interrupted system calls.
