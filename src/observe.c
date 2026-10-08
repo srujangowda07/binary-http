@@ -5,7 +5,9 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <fcntl.h>
+
 #include <limits.h>
 
 #include "protocol.h"
@@ -45,6 +47,12 @@ static int send_error_response(int fd, uint32_t stream_id, int status, const cha
 static void handle_client(int client_fd, const char *docroot) {
     uint8_t hdr_buf[BHTTP_HEADER_SIZE];
 
+    /* Set 5-second socket timeout so slow/stalled clients don't hang the server */
+    struct timeval tv;
+    tv.tv_sec = 5;
+    tv.tv_usec = 0;
+    setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, (const void *)&tv, sizeof(tv));
+
     /* Persistent connection loop: process sequential frames until client disconnects */
     while (1) {
         ssize_t r = net_read_exact(client_fd, hdr_buf, BHTTP_HEADER_SIZE);
@@ -56,6 +64,15 @@ static void handle_client(int client_fd, const char *docroot) {
             /* Unexpected EOF or read error */
             break;
         }
+
+        /* Detect standard text HTTP (e.g. browser sending "GET ", "POST", "HEAD") */
+        if (memcmp(hdr_buf, "GET ", 4) == 0 || memcmp(hdr_buf, "POST", 4) == 0 ||
+            memcmp(hdr_buf, "HEAD", 4) == 0 || memcmp(hdr_buf, "HTTP", 4) == 0) {
+            fprintf(stderr, "[observe] Notice: Text HTTP request detected on binary port. Rejecting.\n");
+            send_error_response(client_fd, 0, STATUS_BAD_REQUEST, "400 Bad Request: Plain text HTTP is not supported. Use bcurl.\n");
+            break;
+        }
+
 
         struct bhttp_frame_header fhdr;
         if (frame_header_decode(&fhdr, hdr_buf) < 0) {
