@@ -1,56 +1,34 @@
 # Binary HTTP (BHTTP)
-**A Lightweight Binary Application-Layer Network Protocol in C**
+
+> A clean, lightweight binary application-layer network protocol written in C directly over raw TCP sockets.
 
 ---
 
-##  Executive Summary
+## What is This Project?
 
-**Binary HTTP (BHTTP)** is an application-layer network protocol designed and implemented in standard C (C99) directly over raw TCP sockets (`SOCK_STREAM`). 
+**BHTTP** is a custom binary protocol designed to replace the text-based parsing of standard HTTP/1.1 with a fast, deterministic binary format. 
 
-Traditional HTTP/1.1 relies on human-readable text formats, whitespace delimiter scanning (`\r\n\r\n`), and regex parsing, making it susceptible to request smuggling, delimiter injection, and parsing ambiguities. **BHTTP** replaces text framing with:
-1. A **fixed 9-byte binary frame header** with deterministic length fields.
-2. An **indexed static header table** combined with 16-bit length-prefixed values (inspired by HPACK).
-3. Robust **TCP stream fragmentation handling** via deterministic stream assembly routines (`read_exact`, `write_all`).
-4. **Persistent connections** enabling multiple sequential request/response exchanges across a single TCP socket.
-5. A **strict security sandbox** preventing directory traversal attacks.
+In traditional HTTP/1.1, messages are plain text separated by line breaks (`\r\n\r\n`). Parsing text with string searches and regex is slow and prone to security vulnerabilities (like HTTP request smuggling). 
 
-The project provides two core applications:
-- **`observe`** (also aliased as **`bserve`**): A persistent BHTTP web server serving files from a document root.
-- **`bcurl`**: A command-line client supporting verbose frame debugging (`-v`) with wire-level hexdumps.
+**BHTTP solves this by making framing binary:**
+- Every frame starts with a **fixed 9-byte binary header** that explicitly tells the receiver how many bytes to read.
+- Common header names (like `content-type` or `host`) are compressed into **1-byte IDs** using a static lookup table.
+- Socket operations cleanly handle TCP stream chunking with helper functions (`read_exact`, `write_all`).
+- Connections stay open by default for multiple requests (**persistent connections**).
+- Directory traversal attacks (like `../../etc/passwd`) are caught and blocked before touching disk.
 
----
-
-##  Table of Contents
-
-1. [Core Protocol Concepts](#-core-protocol-concepts)
-   - [Why Binary Framing?](#1-why-binary-framing)
-   - [9-Byte Frame Header Format](#2-9-byte-frame-header-format)
-   - [Static Header Table & Literal Headers](#3-static-header-table--literal-headers)
-   - [TCP Stream Handling](#4-tcp-stream-handling-partial-reads--writes)
-   - [Persistent Connection Model](#5-persistent-connection-model)
-   - [Security & Path Traversal Prevention](#6-security--path-traversal-prevention)
-   - [Extensibility & Unknown Frame Handling](#7-extensibility--unknown-frame-handling)
-2. [Quick Start & Build Instructions](#-quick-start--build-instructions)
-   - [Building on Linux](#building-on-linux)
-   - [Building & Running on Windows (via WSL)](#building--running-on-windows-via-wsl)
-3. [Running the Server & Client](#-running-the-server--client)
-4. [Example Outputs & Wire Traces](#-example-outputs--wire-traces)
-5. [Testing Suite & Validation](#-testing-suite--validation)
-6. [Repository Structure](#-repository-structure)
+The project includes two programs:
+1. **`observe`** (also aliased as **`bserve`**): A persistent server that serves files from a local directory (document root).
+2. **`bcurl`**: A client tool (similar to `curl`) to send requests, print responses, and inspect raw binary frames on the wire (`-v`).
 
 ---
 
-##  Core Protocol Concepts
+## How It Works (Core Concepts)
 
-### 1. Why Binary Framing?
-- **No Delimiter Injection:** In text HTTP, messages terminate with `\r\n\r\n`. Any payload containing accidental or malicious line breaks requires complex chunked encoding. In BHTTP, payload length is explicitly defined in binary, making delimiter injection mathematically impossible.
-- **Constant-Time Header Parsing:** Reading a fixed 9-byte header takes a predictable, constant number of operations without buffer scanning or backtracking.
-- **Bandwidth Efficiency:** Frequent header keys (such as `content-type`, `host`, `user-agent`) compress down to a single byte rather than repetitive ASCII strings.
+### 1. The 9-Byte Binary Frame Header
+Every message sent over the wire starts with exactly 9 bytes in **Big-Endian (Network Byte Order)**:
 
-### 2. 9-Byte Frame Header Format
-Every BHTTP message begins with an unpadded, 9-byte binary header transmitted in **Network Byte Order (Big-Endian)**:
-
-```
+```text
  0                   1                   2                   3
  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
@@ -62,18 +40,17 @@ Every BHTTP message begins with an unpadded, 9-byte binary header transmitted in
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 ```
 
-| Field | Width | Offset | Purpose |
-| :--- | :--- | :--- | :--- |
-| **Length** | 24 bits (3 bytes) | `0..2` | Payload size in bytes (excluding header). Max size: $2^{24}-1$ (~16 MB). Avoids 64 KB 16-bit limits while preventing 4 GB memory exhaustion DoS attacks. |
-| **Type** | 8 bits (1 byte) | `3` | Frame identifier: `0x01` (`FRAME_REQUEST`), `0x02` (`FRAME_RESPONSE`). |
-| **Flags** | 8 bits (1 byte) | `4` | Modifiers: `0x01` (`FLAG_END_STREAM`) indicates the message payload is complete. |
-| **Reserved (R)** | 1 bit | `5` (MSB) | Reserved bit (set to `0`). |
-| **Stream ID** | 31 bits | `5..8` | Monotonically increasing transaction ID (supports over 2 billion sequential streams). |
+Here is what each field means:
+- **Length (3 bytes / 24 bits):** The size of the payload following this header (max ~16 MB). Because it's explicitly 24 bits, the receiver knows exactly how much memory to allocate without guessing.
+- **Type (1 byte / 8 bits):** `0x01` for a Request frame, `0x02` for a Response frame.
+- **Flags (1 byte / 8 bits):** `0x01` (`FLAG_END_STREAM`) marks that this frame completes the message.
+- **Reserved Bit (R):** Set to `0`.
+- **Stream ID (31 bits):** A sequence number identifying which transaction this frame belongs to (e.g. Stream 1, Stream 2).
 
-### 3. Static Header Table & Literal Headers
-Rather than repeatedly transmitting strings like `"content-type"`, BHTTP maps the 10 most common header names to 1-byte numeric IDs:
+### 2. Static Header Compression Table
+Instead of repeatedly typing out full header strings, BHTTP maps the 10 most common headers to single-byte numbers:
 
-| ID (Hex) | Static Header Name | ID (Hex) | Static Header Name |
+| ID | Header Name | ID | Header Name |
 | :---: | :--- | :---: | :--- |
 | `0x01` | `:method` | `0x06` | `host` |
 | `0x02` | `:path` | `0x07` | `user-agent` |
@@ -81,60 +58,49 @@ Rather than repeatedly transmitting strings like `"content-type"`, BHTTP maps th
 | `0x04` | `content-length` | `0x09` | `accept` |
 | `0x05` | `content-type` | `0x0A` | `connection` |
 
-- **Indexed Header Encoding:** `[1 byte ID][2 bytes Value Length (Big-Endian)][Value Bytes]`
-- **Literal/Custom Header Encoding (`0x00`):** For headers not in the table:  
-  `[0x00][2 bytes Name Length][Name Bytes][2 bytes Value Length][Value Bytes]`
-- **Binary-Safe Values:** Because values are prefixed by a 16-bit length instead of null characters (`\0`), values may contain arbitrary binary bytes.
+- **Known header:** `[1 byte ID][2 bytes value length][value bytes]`  
+  *(Example: sending `content-type: text/plain` sends `0x05` + `0x000A` + `"text/plain"`)*
+- **Custom / Literal header:** If a header isn't in the table, it uses ID `0x00`:  
+  `[0x00][2 bytes name length][name bytes][2 bytes value length][value bytes]`
+- Header values are **length-prefixed**, meaning they can safely carry arbitrary binary data without needing null terminators (`\0`).
 
-### 4. TCP Stream Handling (Partial Reads & Writes)
-TCP is an **unstructured byte stream** with no record boundaries. A single `send()` can be split into multiple `recv()` chunks across network buffers.
+### 3. Handling Real TCP Streams
+TCP delivers an unstructured stream of bytes—not individual messages. A single `send()` call might arrive broken across two `recv()` calls, or multiple messages might get glued together in the network buffer.
 
-To guarantee deterministic message assembly, BHTTP implements three core socket helpers in `src/net.c`:
-- `net_read_exact(fd, buf, len)`: Loops `recv()` until exactly `len` bytes have arrived, handling `EINTR` signals and detecting clean vs. truncated disconnects.
-- `net_write_all(fd, buf, len)`: Loops `send()` until all bytes have entered the socket buffer, accommodating socket backpressure.
-- `net_discard_exact(fd, len)`: Drains unneeded bytes from the socket into a scratch buffer without memory leaks.
+BHTTP handles this using dedicated stream helpers in `src/net.c`:
+- **`net_read_exact()`**: Loops `recv()` until the exact requested number of bytes have arrived. It automatically handles interrupted system calls (`EINTR`) and detects premature disconnects.
+- **`net_write_all()`**: Loops `send()` until the entire buffer is pushed into the socket kernel buffer.
+- **`net_discard_exact()`**: If an unknown frame arrives, this safely reads and discards that exact number of bytes so the connection can continue cleanly.
 
-### 5. Persistent Connection Model
-BHTTP connections default to persistent operation:
-1. The server reads the 9-byte header and processes the request.
-2. The server sends the response frame.
-3. Instead of closing the socket, the server immediately loops back to read the next frame on the same socket descriptor.
-4. When the client closes the connection, `recv()` returns `0`, and the server cleanly exits the connection loop.
+### 4. Persistent Connections
+When the server sends a response, it **does not close the socket**. It immediately loops back and listens for the next 9-byte header from the same client. Only when the client disconnects (or times out) does the server close the connection.
 
-### 6. Security & Path Traversal Prevention
-Web servers must prevent directory traversal attacks (e.g., `GET /../../etc/passwd`). The server enforces sandboxing in `resolve_safe_path()`:
-- **Syntactic Rejection:** Any path containing `..`, backslashes (`\`), or null bytes is immediately rejected with `400 Bad Request`.
-- **Filesystem Canonicalization:** Resolves paths via `realpath()` and verifies that the canonical file path strictly starts with the canonical document root directory.
-- **Status Codes:**
-  - `200 OK`: File successfully located and served.
-  - `400 Bad Request`: Malformed frame, path traversal attempt, or unsupported method.
-  - `404 Not Found`: File does not exist within the document root.
-  - `500 Internal Server Error`: Filesystem I/O or allocation error.
-
-### 7. Extensibility & Unknown Frame Handling
-If an endpoint encounters an unknown frame type (e.g. `0xAA`), it reads the 24-bit length, calls `net_discard_exact()`, and continues processing subsequent frames. This allows future protocol versions (e.g. Version 2) to introduce new frames without breaking Version 1 endpoints.
+### 5. Built-in Security Sandbox
+The server validates requested file paths in `resolve_safe_path()`:
+- Rejects any URL path containing `..`, backslashes (`\`), or null bytes with `400 Bad Request`.
+- Canonicalizes the path using `realpath()` and verifies that the target file strictly lives inside the `./www` folder.
 
 ---
 
-##  Quick Start & Build Instructions
+## Quick Start & Build Instructions
 
 ### Prerequisites
-- GCC / Clang (with C99 support)
+- GCC or Clang (supporting C99)
 - GNU Make
-- POSIX socket environment (Linux, macOS, or Windows via WSL)
+- Linux, macOS, or Windows with WSL
 
 ---
 
-### Building on Linux
+### Building on Linux / Ubuntu
 
 ```bash
-# 1. Compile the server, client, and test suites
+# Compile server, client, and unit tests
 make all
 
-# 2. Run all unit and integration tests
+# Run all automated tests
 make test
 
-# 3. Clean all build artifacts
+# Clean compiled binaries and object files
 make clean
 ```
 
@@ -142,29 +108,15 @@ make clean
 
 ### Building & Running on Windows (via WSL)
 
-Because BHTTP utilizes standard POSIX/BSD socket APIs (`<sys/socket.h>`, `<netdb.h>`), Windows users can run and test everything seamlessly using **WSL (Windows Subsystem for Linux)**.
+Because network socket programming uses POSIX APIs (`<sys/socket.h>`), Windows users run the project using **WSL (Windows Subsystem for Linux)**.
 
-#### Option A: Running from inside WSL Terminal
-1. Open PowerShell and launch WSL:
-   ```powershell
-   wsl
-   ```
-2. Navigate to your repository directory:
-   ```bash
-   cd /.../binary-http
-   ```
-3. Build and test:
-   ```bash
-   make clean
-   make all
-   make test
-   ```
+> 💡 **Important for Windows PowerShell:**  
+> The binaries (`observe`, `bcurl`) are Linux executables. When running them from Windows PowerShell, remember to prefix commands with `wsl` (for example: `wsl ./bcurl ...`).  
+> Alternatively, type `wsl` into PowerShell once to switch into the Linux terminal directly.
 
-#### Option B: Direct PowerShell Commands (One-Liners)
-You can build, test, and run the project directly from PowerShell without entering the WSL shell interactively:
-
+#### PowerShell One-Liners:
 ```powershell
-# Compile the project
+# Compile everything
 wsl make all
 
 # Run the complete test suite
@@ -173,64 +125,91 @@ wsl make test
 # Start the server on port 9000
 wsl ./observe ./www 9000
 
-# In a separate PowerShell window, run the client
-wsl ./bcurl localhost:9000/index.html
+# Fetch a file using bcurl
+wsl ./bcurl localhost:9000/hello.txt
 ```
-
-> **Note on IDE / Editor Support:** All header files (`include/headers.h`, `include/net.h`, `include/protocol.h`) include portable fallbacks for `ssize_t` so that Windows language servers (clangd, MSVC IntelliSense) display **zero errors or missing header warnings**.
 
 ---
 
-##  Running the Server & Client
+## Step-by-Step Manual Testing
 
-### 1. Start the Server
-Open Terminal 1:
+To see the client and server communicate, open **two terminal windows**:
+
+### Step 1: Start the Server (Terminal 1)
 ```bash
-./observe <document_root> <port>
-```
-Example:
-```bash
+# In Linux / WSL:
 ./observe ./www 9000
+
+# Or from Windows PowerShell:
+wsl ./observe ./www 9000
 ```
-*(You can also use `./bserve ./www 9000`)*
-
-### 2. Run the Client (`bcurl`)
-Open Terminal 2:
-
-#### Request HTML document:
-```bash
-./bcurl localhost:9000/index.html
-```
-
-#### Request Plain Text:
-```bash
-./bcurl localhost:9000/hello.txt
-```
-
-#### Request JSON:
-```bash
-./bcurl localhost:9000/sample.json
-```
-
-#### Request with Verbose Wire Debugging (`-v`):
-```bash
-./bcurl -v localhost:9000/hello.txt
+You will see:
+```text
+[observe] Serving ./www on port 9000
 ```
 
 ---
 
-##  Example Outputs & Wire Traces
+### Step 2: Run Client Requests (Terminal 2)
 
-### Normal Execution (Clean `stdout`)
+#### 1. Fetch Plain Text
 ```bash
-$ ./bcurl localhost:9000/hello.txt
+wsl ./bcurl localhost:9000/hello.txt
+```
+**Output:**
+```text
 Hello, BHTTP!
 This is a plain text file served cleanly over the custom binary protocol.
 ```
 
-### Verbose Mode (`-v` on `stderr` + payload on `stdout`)
+#### 2. Fetch JSON
 ```bash
-$ ./bcurl -v localhost:9000/hello.txt
+wsl ./bcurl localhost:9000/sample.json
+```
+**Output:**
+```json
+{
+  "project": "binary-http",
+  "course": "Computer Networks",
+  "protocol": "BHTTP",
+  "version": "1.0",
+  "features": [
+    "binary_framing",
+    "static_header_table",
+    "length_prefixed_values",
+    "persistent_connections",
+    "unknown_frame_skipping"
+  ]
+}
+```
+
+#### 3. Fetch HTML
+```bash
+wsl ./bcurl localhost:9000/index.html
+```
+**Output:**
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Binary HTTP</title>
+</head>
+<body>
+    <h1>Hello, Binary HTTP!</h1>
+    <p>This page was served over a custom binary framing protocol running on raw TCP.</p>
+</body>
+</html>
+```
+
+#### 4. Verbose Mode (`-v` flag)
+Adding `-v` prints connection details and an annotated hexdump of the raw binary frames on `stderr`, while keeping `stdout` clean for the body:
+
+```bash
+wsl ./bcurl -v localhost:9000/hello.txt
+```
+**Output:**
+```text
 * Connecting to localhost port 9000...
 * Connected successfully.
 > Transmitting FRAME_REQUEST (65 bytes, Stream ID 1):
@@ -260,100 +239,108 @@ Hello, BHTTP!
 This is a plain text file served cleanly over the custom binary protocol.
 ```
 
-### Error Handling Demonstration
+---
 
-#### 1. File Not Found (404)
+### Error Handling Tests
+
+#### 1. File Not Found (`404`)
 ```bash
-$ ./bcurl -v localhost:9000/does_not_exist.html
+wsl ./bcurl -v localhost:9000/nonexistent.html
+```
+**Output:**
+```text
 * Connecting to localhost port 9000...
 * Connected successfully.
 ...
 < Status: 404
 < :status: 404
 < content-type: text/plain
+< content-length: 39
 < server: observe/1.0
-404 Not Found
+< connection: keep-alive
+404 Not Found: Resource Does Not Exist
 ```
-*(Returns non-zero exit code `1`)*
+*(Client exits with code `1`)*
 
-#### 2. Directory Traversal Rejection (400)
+#### 2. Directory Traversal Rejection (`400`)
 ```bash
-$ ./bcurl -v localhost:9000/../../etc/passwd
+wsl ./bcurl -v localhost:9000/../../etc/passwd
+```
+**Output:**
+```text
 * Connecting to localhost port 9000...
 * Connected successfully.
 ...
 < Status: 400
 < :status: 400
 < content-type: text/plain
+< content-length: 36
 < server: observe/1.0
-400 Bad Request
+< connection: keep-alive
+400 Bad Request: Path Traversal Rejected
 ```
-*(Blocked syntactically and sandboxed)*
+*(The path is blocked by the security sandbox before accessing disk)*
 
 ---
 
-## Testing Suite & Validation
+## Automated Test Suite
 
-Run the automated test suite with:
+You can run all tests with one command:
 ```bash
 make test
+# OR from Windows PowerShell:
+wsl make test
 ```
 
-### Test Coverage Summary:
-1. **Unit Tests:**
-   - `tests/test_frames.c`: Validates 9-byte header packing, bitwise masking, and 24-bit length boundary conditions (`0` to `16,777,215`).
-   - `tests/test_headers.c`: Validates static table lookups (`1..10`), custom literal header codec (`0x00`), and malformed length detection.
-   - `tests/test_protocol.c`: Verifies byte-for-byte exact equality between serialized frames and wire expectations.
-2. **Integration Tests (`tests/test_integration.sh`):**
-   - Automatically spins up the server in the background.
-   - Fetches and verifies exact diffs of HTML, TXT, and JSON files.
-   - Tests 404 Not Found and 400 Bad Request handling.
-   - Tests `stdout`/`stderr` channel separation in verbose mode.
-3. **Independent Interoperability Harness (`tests/interop_test.py`):**
-   - An independent Python socket client building raw binary frames directly.
-   - Validates persistent transactions across a single TCP socket.
-   - Tests the **unknown-frame extensibility rule**: sends unknown frame `0xAA` with 20 bytes of dummy payload, verifies the server cleanly discards it and answers subsequent requests with `200 OK`.
+### What is Tested:
+1. **`tests/test_frames.c`**: Validates 9-byte header packing, bit shifting, and 24-bit length edge cases (`0` to `16,777,215`).
+2. **`tests/test_headers.c`**: Validates static table IDs (`1..10`), custom literal header format (`0x00`), and malformed header detection.
+3. **`tests/test_protocol.c`**: Compares serialized frames byte-for-byte against the expected wire representation.
+4. **`tests/test_integration.sh`**: Boots the server in the background and tests file fetching, 404 responses, traversal rejection, and verbose output separation.
+5. **`tests/interop_test.py`**: An independent Python test client that talks directly to the server using raw sockets. It tests:
+   - Persistent sequential requests on a single socket.
+   - **Unknown frame skipping:** sends an unassigned frame type (`0xAA`) with dummy payload and verifies the server cleanly drains it and answers subsequent requests with `200 OK`.
 
 ---
 
-##  Repository Structure
+## Repository Structure
 
-```
+```text
 binary-http/
 ├── src/
-│   ├── observe.c         # BHTTP server implementation
-│   ├── bcurl.c           # Command-line client with verbose hexdump
-│   ├── protocol.c        # Request/Response payload encoder & decoder
-│   ├── frame.c           # Fixed 9-byte frame header serializer & parser
-│   ├── headers.c         # Static table and header list codec
-│   ├── net.c             # Socket stream helpers (read_exact, write_all, discard_exact)
-│   └── util.c            # URL parser, safe path resolver, MIME detector, hexdump printer
+│   ├── observe.c           # Web server implementation
+│   ├── bcurl.c             # Command-line client with verbose hexdump
+│   ├── protocol.c          # Frame payload encoder & decoder
+│   ├── frame.c             # Fixed 9-byte frame header serializer & parser
+│   ├── headers.c           # Static compression table and header list codec
+│   ├── net.c               # TCP socket helpers (read_exact, write_all, discard_exact)
+│   └── util.c              # URL parser, safe path resolver, MIME detector
 ├── include/
-│   ├── protocol.h        # Protocol constants and data structures
-│   ├── frame.h           # Frame header definitions
-│   ├── headers.h         # Header table definitions & cross-platform ssize_t
-│   ├── net.h             # Network socket interfaces
-│   └── util.h            # Path resolution and utility interfaces
+│   ├── protocol.h          # Core protocol constants and structures
+│   ├── frame.h             # Frame header interface
+│   ├── headers.h           # Header table definitions & cross-platform types
+│   ├── net.h               # Networking interface
+│   └── util.h              # Utility and path resolution interface
 ├── tests/
-│   ├── test_frames.c     # Unit tests for frame header encoding
-│   ├── test_headers.c    # Unit tests for header compression table
-│   ├── test_protocol.c   # Wire-level reference validation
+│   ├── test_frames.c       # Unit tests for frame headers
+│   ├── test_headers.c      # Unit tests for header compression table
+│   ├── test_protocol.c     # Wire-level frame tests
 │   ├── test_integration.sh # Automated end-to-end integration test runner
-│   └── interop_test.py   # Independent Python socket test client
+│   └── interop_test.py     # Independent Python socket test client
 ├── www/
-│   ├── index.html        # Sample HTML test resource
-│   ├── hello.txt         # Sample plain text test resource
-│   └── sample.json       # Sample JSON test resource
-├── .gitignore            # Clean git configuration for assignment submission
-├── Makefile              # Build configuration with all, test, clean targets
-└── README.md             # Complete user guide and technical documentation
+│   ├── index.html          # Sample HTML test resource
+│   ├── hello.txt           # Sample plain text test resource
+│   └── sample.json         # Sample JSON test resource
+├── .gitignore              # Clean git configuration
+├── Makefile                # Build configuration (make all, make test, make clean)
+└── README.md               # Documentation and usage guide
 ```
 
 ---
 
-##  Summary of Technical Highlights
+## Technical Highlights
 
 - **Standard C99:** Written cleanly without proprietary compiler extensions.
-- **Robust POSIX Sockets:** Comprehensive handling of partial transfers and interrupted system calls.
-- **Clean Architecture:** Strict separation between framing, header compression, network transport, and filesystem routing.
-- **Zero Compiler Warnings:** Compiles cleanly with `-Wall -Wextra -Wpedantic -std=c99`.
+- **Robust Sockets:** Fully handles TCP stream fragmentation and partial reads/writes.
+- **Clean Separation of Concerns:** Network I/O, binary framing, header encoding, and filesystem routing are organized into modular files.
+- **Zero Warnings:** Compiles with zero warnings under `-Wall -Wextra -Wpedantic -std=c99`.
