@@ -1,0 +1,28 @@
+# Binaries
+observe
+bserve
+bcurl
+
+# Object files
+*.o
+src/*.o
+tests/*.o
+
+# Test executables
+tests/test_frames
+tests/test_headers
+tests/test_protocol
+*.exe
+tests/*.exe
+
+
+# Temporary and test logs
+*.tmp
+*.log
+actual_*.txt
+index_*.txt
+
+# Documentation & spec notes not pushed to submission repo
+docs/
+SPEC.md
+

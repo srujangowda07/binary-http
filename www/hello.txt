@@ -1,0 +1,2 @@
+Hello, BHTTP!
+This is a plain text file served cleanly over the custom binary protocol.

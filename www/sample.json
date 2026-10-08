@@ -1,0 +1,13 @@
+{
+  "project": "binary-http",
+  "course": "Computer Networks",
+  "protocol": "BHTTP",
+  "version": "1.0",
+  "features": [
+    "binary_framing",
+    "static_header_table",
+    "length_prefixed_values",
+    "persistent_connections",
+    "unknown_frame_skipping"
+  ]
+}
